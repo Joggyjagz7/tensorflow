@@ -95,7 +95,8 @@ struct NthElementFunctor<CPUDevice, T> {
     const int last_dim = input_tensor.dim_size(input_tensor.dims() - 1);
 
     // Allocate each row to different shard.
-    auto SubNthElement = [&, input, output, last_dim, n](int start, int limit) {
+    auto SubNthElement = [&, input, output, last_dim, n](int64 start,
+                                                         int64 limit) {
       // std::nth_element would rearrange the array, so we need a new buffer.
       std::vector<T> buf(last_dim);
 
@@ -114,7 +115,7 @@ struct NthElementFunctor<CPUDevice, T> {
 
     auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
     // The average time complexity of partition-based nth_element (BFPRT) is
-    // O(n), althought the worst time complexity could be O(n^2). Here, 20 is a
+    // O(n), although the worst time complexity could be O(n^2). Here, 20 is a
     // empirical factor of cost_per_unit.
     Shard(worker_threads.num_threads, worker_threads.workers, num_rows,
           20 * last_dim, SubNthElement);

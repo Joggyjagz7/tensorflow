@@ -60,6 +60,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import re
+
 from tensorflow.contrib.model_pruning.python import pruning_utils
 from tensorflow.contrib.model_pruning.python.layers import core_layers as core
 from tensorflow.contrib.training.python.training import hparam
@@ -152,8 +154,17 @@ def get_pruning_hparams():
     end_pruning_step: integer
       the global step at which to terminate pruning. Defaults to -1 implying
       that pruning continues till the training stops
-    do_not_prune: list of strings
-      list of layers that are not pruned
+    weight_sparsity_map: list of strings
+       comma separed list of {weight_variable_name:target sparsity} or
+       {regex:target sparsity} pairs.
+       For layers/weights not in this list, sparsity as specified by the
+       target_sparsity hyperparameter is used.
+       Eg. [conv1:0.9,conv2/kernel:0.8]
+    block_dims_map: list of strings
+       comma separated list of {weight variable name:block_height x block_width}
+       or {regex:block_height x block_width} pairs. For layers/weights not in
+       this list, block dims are specified by the block_height, block_width
+       hyperparameters are used Eg. [dense1:4x4,dense2:1x16,dense3:1x1]
     threshold_decay: float
       the decay factor to use for exponential decay of the thresholds
     pruning_frequency: integer
@@ -161,9 +172,11 @@ def get_pruning_hparams():
     nbins: integer
       number of bins to use for histogram computation
     block_height: integer
-      number of rows in a block (defaults to 1)
+      number of rows in a block (defaults to 1), can be -1 in which
+      case it is set to the size of the corresponding weight tensor.
     block_width: integer
-      number of cols in a block (defaults to 1)
+      number of cols in a block (defaults to 1), can be -1 in which
+      case it is set to the size of the corresponding weight tensor.
     block_pooling_function: string
       Whether to perform average (AVG) or max (MAX) pooling in the block
       (default: AVG)
@@ -200,18 +213,19 @@ def get_pruning_hparams():
       name='model_pruning',
       begin_pruning_step=0,
       end_pruning_step=-1,
-      do_not_prune=[''],
-      threshold_decay=0.9,
+      weight_sparsity_map=[''],
+      block_dims_map=[''],
+      threshold_decay=0.0,
       pruning_frequency=10,
       nbins=256,
       block_height=1,
       block_width=1,
       block_pooling_function='AVG',
-      initial_sparsity=0,
+      initial_sparsity=0.0,
       target_sparsity=0.5,
       sparsity_function_begin_step=0,
       sparsity_function_end_step=100,
-      sparsity_function_exponent=3,
+      sparsity_function_exponent=3.0,
       use_tpu=False)
 
 
@@ -234,6 +248,9 @@ class Pruning(object):
     # Pruning specification
     self._spec = spec if spec else get_pruning_hparams()
 
+    # Sanity check for pruning hparams
+    self._validate_spec()
+
     # A tensorflow variable that tracks the sparsity function.
     # If not provided as input, the graph must already contain the global_step
     # variable before calling this constructor.
@@ -241,7 +258,8 @@ class Pruning(object):
 
     # Stores the tensorflow sparsity variable.
     # Built using self._setup_sparsity() or provided externally
-    self._sparsity = sparsity if sparsity else self._setup_sparsity()
+    self._sparsity = (sparsity
+                      if sparsity is not None else self._setup_sparsity())
 
     # List of tensorflow assignments ops for new masks and thresholds
     self._assign_ops = []
@@ -251,10 +269,44 @@ class Pruning(object):
     self._last_update_step = self._setup_last_update_step()
 
     # Block dimensions
-    self._block_dim = [self._spec.block_height, self._spec.block_width]
+    self._block_dims = [self._spec.block_height, self._spec.block_width]
 
     # Block pooling function
     self._block_pooling_function = self._spec.block_pooling_function
+
+    # Mapping of layer/weight names and block dims
+    self._block_dims_map = self._get_block_dims_map()
+
+    # Mapping of weight names and target sparsity
+    self._weight_sparsity_map = self._get_weight_sparsity_map()
+
+  def _validate_spec(self):
+    spec = self._spec
+    if spec.begin_pruning_step < 0:
+      raise ValueError('Illegal value for begin_pruning_step')
+
+    if spec.begin_pruning_step >= spec.end_pruning_step:
+      if spec.end_pruning_step != -1:
+        raise ValueError(
+            'Pruning must begin before it can end. begin_step=%d, end_step=%d.'
+            'Set end_pruning_step to -1 if pruning is required till training'
+            'stops' % (spec.begin_pruning_step, spec.end_pruning_step))
+
+    if spec.sparsity_function_begin_step < 0:
+      raise ValueError('Illegal value for sparsity_function_begin_step')
+
+    if spec.sparsity_function_begin_step >= spec.sparsity_function_end_step:
+      raise ValueError(
+          'Sparsity function requires begin_step < end_step')
+
+    if not 0.0 <= spec.threshold_decay < 1.0:
+      raise ValueError('threshold_decay must be in range [0,1)')
+
+    if not 0.0 <= spec.initial_sparsity < 1.0:
+      raise ValueError('initial_sparsity must be in range [0,1)')
+
+    if not 0.0 <= spec.target_sparsity < 1.0:
+      raise ValueError('target_sparsity must be in range [0,1)')
 
   def _setup_global_step(self, global_step):
     graph_global_step = global_step
@@ -269,11 +321,6 @@ class Pruning(object):
     initial_sparsity = self._spec.initial_sparsity
     target_sparsity = self._spec.target_sparsity
     exponent = self._spec.sparsity_function_exponent
-
-    if begin_step >= end_step:
-      raise ValueError(
-          'Pruning must begin before it can end. begin_step=%d, end_step=%d' %
-          (begin_step, end_step))
 
     with ops.name_scope(self._spec.name):
       p = math_ops.minimum(
@@ -306,15 +353,67 @@ class Pruning(object):
             'last_mask_update_step', dtype=dtypes.int32)
     return last_update_step
 
-  def _exists_in_do_not_prune_list(self, tensor_name):
-    do_not_prune_list = self._spec.do_not_prune
-    if not do_not_prune_list[0]:
-      return False
-    for layer_name in do_not_prune_list:
-      if tensor_name.find(layer_name) != -1:
-        return True
+  def _get_block_dims_map(self):
+    """Returns the map of layer name: block dims."""
+    block_dims_map = {}
+    val_list = self._spec.block_dims_map
+    filtered_val_list = [l for l in val_list if l]
+    for val in filtered_val_list:
+      weight_name, block_dims_str = val.split(':')
+      block_dims_str = block_dims_str.split('x')
+      if len(block_dims_str) != 2:
+        raise ValueError('Expected 2 values for block dim for %s, got %s' %
+                         (weight_name, block_dims_str))
+      block_dims = [int(block_dims_str[0]), int(block_dims_str[1])]
+      block_dims_map[re.compile(weight_name)] = block_dims
 
-    return False
+    return block_dims_map
+
+  def _get_block_dims(self, weight_name):
+    """Returns the block dims for the given layer/weight name."""
+    block_dims_list = [
+        block_dims for regexp, block_dims in self._block_dims_map.items()
+        if regexp.search(weight_name)
+    ]
+    if not block_dims_list:
+      return self._block_dims
+
+    if len(block_dims_list) > 1:
+      raise ValueError('Multiple matches in block_dims_map for weight %s' %
+                       weight_name)
+
+    return block_dims_list[0]
+
+  def _get_weight_sparsity_map(self):
+    """Returns the map of weight_name:sparsity parsed from the hparams."""
+    weight_sparsity_map = {}
+    val_list = self._spec.weight_sparsity_map
+    filtered_val_list = [l for l in val_list if l]
+    for val in filtered_val_list:
+      weight_name, sparsity = val.split(':')
+      if float(sparsity) >= 1.0:
+        raise ValueError('Weight sparsity can not exceed 1.0')
+      weight_sparsity_map[re.compile(weight_name)] = float(sparsity)
+
+    return weight_sparsity_map
+
+  def _get_sparsity(self, weight_name):
+    """Returns target sparsity for the given layer/weight name."""
+    target_sparsity = [
+        sparsity for regexp, sparsity in self._weight_sparsity_map.items()
+        if regexp.search(weight_name)
+    ]
+    if not target_sparsity:
+      return self._sparsity
+
+    if len(target_sparsity) > 1:
+      raise ValueError(
+          'Multiple matches in weight_sparsity_map for weight %s' % weight_name)
+    # TODO(suyoggupta): This will work when initial_sparsity = 0. Generalize
+    # to handle other cases as well.
+    return math_ops.mul(
+        self._sparsity,
+        math_ops.div(target_sparsity[0], self._spec.target_sparsity))
 
   def _update_mask(self, weights, threshold):
     """Updates the mask for a given weight tensor.
@@ -342,27 +441,27 @@ class Pruning(object):
     if self._sparsity is None:
       raise ValueError('Sparsity variable undefined')
 
+    sparsity = self._get_sparsity(weights.op.name)
     with ops.name_scope(weights.op.name + '_pruning_ops'):
       abs_weights = math_ops.abs(weights)
-      max_value = math_ops.reduce_max(abs_weights)
-      cdf_fn = pruning_utils.compute_cdf_from_histogram
-      if self._spec.use_tpu:
-        cdf_fn = pruning_utils.compute_cdf
-
-      norm_cdf = cdf_fn(abs_weights, [0.0, max_value], nbins=self._spec.nbins)
-      current_threshold = math_ops.multiply(
-          math_ops.div(
-              math_ops.reduce_sum(
-                  math_ops.cast(
-                      math_ops.less(norm_cdf, self._sparsity), dtypes.float32)),
-              float(self._spec.nbins)), max_value)
-
+      k = math_ops.cast(
+          math_ops.round(
+              math_ops.cast(array_ops.size(abs_weights), dtypes.float32) *
+              (1 - sparsity)), dtypes.int32)
+      # Sort the entire array
+      values, _ = nn_ops.top_k(
+          array_ops.reshape(abs_weights, [-1]), k=array_ops.size(abs_weights))
+      # Grab the (k-1) th value
+      current_threshold = array_ops.gather(values, k - 1)
       smoothed_threshold = math_ops.add_n([
           math_ops.multiply(current_threshold, 1 - self._spec.threshold_decay),
           math_ops.multiply(threshold, self._spec.threshold_decay)
       ])
+
       new_mask = math_ops.cast(
-          math_ops.greater(abs_weights, smoothed_threshold), dtypes.float32)
+          math_ops.greater_equal(abs_weights, smoothed_threshold),
+          dtypes.float32)
+
     return smoothed_threshold, new_mask
 
   def _maybe_update_block_mask(self, weights, threshold):
@@ -387,23 +486,34 @@ class Pruning(object):
     Raises:
       ValueError: if block pooling function is not AVG or MAX
     """
+    block_dims = self._get_block_dims(weights.op.name)
     squeezed_weights = array_ops.squeeze(weights)
-    if squeezed_weights.get_shape().ndims != 2 or self._block_dim == [1, 1]:
+    if squeezed_weights.get_shape().ndims != 2 or block_dims == [1, 1]:
       return self._update_mask(weights, threshold)
+
+    for i in range(2):
+      if block_dims[i] == -1:
+        block_dims[i] = squeezed_weights.get_shape()[i]
 
     if self._block_pooling_function not in ['AVG', 'MAX']:
       raise ValueError('Unknown pooling function for block sparsity: %s' %
                        self._block_pooling_function)
 
     with ops.name_scope(weights.op.name + '_pruning_ops'):
-      abs_weights = math_ops.abs(
-          array_ops.reshape(weights, [
-              1,
-              squeezed_weights.get_shape()[0],
-              squeezed_weights.get_shape()[1], 1
-          ]))
-      pool_window = [self._block_dim[0], self._block_dim[1]]
-      pooled_weights = nn_ops.pool(
+      abs_weights = math_ops.abs(squeezed_weights)
+
+      pool_window = block_dims
+      pool_fn = pruning_utils.factorized_pool
+      squeeze_axis = None
+      if not self._spec.use_tpu:
+        pool_fn = nn_ops.pool
+        abs_weights = array_ops.reshape(
+            abs_weights,
+            [1, abs_weights.get_shape()[0],
+             abs_weights.get_shape()[1], 1])
+        squeeze_axis = [0, 3]
+
+      pooled_weights = pool_fn(
           abs_weights,
           window_shape=pool_window,
           pooling_type=self._block_pooling_function,
@@ -411,19 +521,18 @@ class Pruning(object):
           padding='SAME',
           name=weights.op.name + '_pooled')
 
+      if pooled_weights.get_shape().ndims != 2:
+        pooled_weights = array_ops.squeeze(pooled_weights, axis=squeeze_axis)
+
       smoothed_threshold, new_mask = self._update_mask(pooled_weights,
                                                        threshold)
 
-      reshaped_mask = array_ops.reshape(
-          new_mask,
-          [pooled_weights.get_shape()[1],
-           pooled_weights.get_shape()[2]])
-      updated_mask = pruning_utils.kronecker_product(
-          reshaped_mask, array_ops.ones(self._block_dim))
+      updated_mask = pruning_utils.expand_tensor(new_mask, block_dims)
       sliced_mask = array_ops.slice(
           updated_mask, [0, 0],
           [squeezed_weights.get_shape()[0],
            squeezed_weights.get_shape()[1]])
+
     return smoothed_threshold, array_ops.reshape(sliced_mask,
                                                  array_ops.shape(weights))
 
@@ -448,10 +557,6 @@ class Pruning(object):
       is_partitioned = isinstance(weight, variables.PartitionedVariable)
       if is_partitioned:
         weight = weight.as_tensor()
-
-      if self._spec.do_not_prune:
-        if self._exists_in_do_not_prune_list(mask.name):
-          continue
 
       new_threshold, new_mask = self._maybe_update_block_mask(weight, threshold)
       self._assign_ops.append(
@@ -503,22 +608,15 @@ class Pruning(object):
                                  no_update_op)
 
   def add_pruning_summaries(self):
-    """Adds summaries for this pruning spec.
-
-    Args: none
-
-    Returns: none
-    """
+    """Adds summaries of weight sparsities and thresholds."""
     with ops.name_scope(self._spec.name + '_summaries'):
       summary.scalar('sparsity', self._sparsity)
       summary.scalar('last_mask_update_step', self._last_update_step)
       masks = get_masks()
       thresholds = get_thresholds()
-      for index, mask in enumerate(masks):
-        if not self._exists_in_do_not_prune_list(mask.name):
-          summary.scalar(mask.name + '/sparsity', nn_impl.zero_fraction(mask))
-          summary.scalar(thresholds[index].op.name + '/threshold',
-                         thresholds[index])
+      for mask, threshold in zip(masks, thresholds):
+        summary.scalar(mask.op.name + '/sparsity', nn_impl.zero_fraction(mask))
+        summary.scalar(threshold.op.name + '/threshold', threshold)
 
   def print_hparams(self):
     logging.info(self._spec.to_json())

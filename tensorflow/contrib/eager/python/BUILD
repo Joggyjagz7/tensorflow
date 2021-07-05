@@ -1,9 +1,10 @@
-licenses(["notice"])  # Apache 2.0
-
-package(default_visibility = ["//tensorflow:internal"])
-
 load("//tensorflow:tensorflow.bzl", "py_test")
 load("//tensorflow:tensorflow.bzl", "cuda_py_test")
+
+package(
+    default_visibility = ["//tensorflow:internal"],
+    licenses = ["notice"],  # Apache 2.0
+)
 
 py_library(
     name = "tfe",
@@ -14,6 +15,7 @@ py_library(
         ":datasets",
         ":metrics",
         ":network",
+        ":parameter_server",
         ":saver",
         "//tensorflow/python:framework_ops",
         "//tensorflow/python:framework_test_lib",
@@ -26,8 +28,10 @@ py_library(
         "//tensorflow/python:variable_scope",
         "//tensorflow/python/eager:backprop",
         "//tensorflow/python/eager:context",
+        "//tensorflow/python/eager:def_function",
         "//tensorflow/python/eager:execution_callbacks",
         "//tensorflow/python/eager:function",
+        "//tensorflow/python/eager:remote",
     ],
 )
 
@@ -96,6 +100,18 @@ py_library(
     ],
 )
 
+py_library(
+    name = "parameter_server",
+    srcs = ["parameter_server.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        "//tensorflow/python:framework",
+        "//tensorflow/python:resource_variable_ops",
+        "//tensorflow/python:variable_scope",
+        "//tensorflow/python/eager:context",
+    ],
+)
+
 cuda_py_test(
     name = "saver_test",
     srcs = ["saver_test.py"],
@@ -104,7 +120,6 @@ cuda_py_test(
         "//tensorflow/python:array_ops",
         "//tensorflow/python:client",
         "//tensorflow/python:client_testlib",
-        "//tensorflow/python/eager:graph_callable",
         "//tensorflow/python/eager:test",
         "//tensorflow/python:variables",
     ],
@@ -120,7 +135,6 @@ py_library(
     visibility = ["//tensorflow:internal"],
     deps = [
         "//tensorflow/python:array_ops",
-        "//tensorflow/python:checkpointable",
         "//tensorflow/python:control_flow_ops",
         "//tensorflow/python:dtypes",
         "//tensorflow/python:framework_ops",
@@ -131,12 +145,14 @@ py_library(
         "//tensorflow/python:variable_scope",
         "//tensorflow/python/eager:context",
         "//tensorflow/python/eager:function",
+        "//tensorflow/python/training/tracking:base",
     ],
 )
 
 py_test(
     name = "metrics_test",
     srcs = ["metrics_test.py"],
+    python_version = "PY2",
     srcs_version = "PY2AND3",
     deps = [
         ":metrics",
@@ -174,6 +190,7 @@ py_library(
 py_test(
     name = "evaluator_test",
     srcs = ["evaluator_test.py"],
+    python_version = "PY2",
     srcs_version = "PY2AND3",
     deps = [
         ":evaluator",
@@ -199,13 +216,14 @@ py_library(
         "//tensorflow/python:training",
         "//tensorflow/python:variable_scope",
         "//tensorflow/python/eager:context",
-        "//tensorflow/python/estimator:util",
+        "//tensorflow/python/estimator:estimator_py",
     ],
 )
 
 py_test(
     name = "network_test",
     srcs = ["network_test.py"],
+    python_version = "PY2",
     srcs_version = "PY2AND3",
     deps = [
         ":network",
@@ -221,5 +239,20 @@ py_test(
         "//tensorflow/python:variable_scope",
         "//tensorflow/python/eager:function",
         "//tensorflow/python/eager:test",
+    ],
+)
+
+cuda_py_test(
+    name = "remote_test",
+    srcs = ["remote_test.py"],
+    additional_deps = [
+        ":parameter_server",
+        "//tensorflow/python/eager:remote",
+        "//tensorflow/contrib/eager/python:tfe",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:client",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python/eager:function",
     ],
 )
